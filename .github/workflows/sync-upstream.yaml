@@ -1,0 +1,172 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5' # 6 AM PT (2 PM UTC), weekdays
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add prom-upstream https://github.com/prometheus/prometheus.git
+          git fetch prom-upstream main --tags
+
+      - name: Close stale upstream mirror PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr list --base upstream/main --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("sync/upstream-mirror-")) | [.number, .headRefName] | @tsv' | \
+          while IFS=$'\t' read -r pr_num branch; do
+            echo "Closing stale upstream mirror PR #$pr_num ($branch)"
+            gh pr close "$pr_num" --comment "Superseded by newer upstream sync"
+            git push origin --delete "$branch" 2>/dev/null || true
+          done
+
+      - name: Merge upstream and open PR to upstream/main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git checkout origin/upstream/main
+          git reset --hard prom-upstream/main
+          git push -f origin HEAD:upstream/main
+
+      - name: Detect latest upstream release tag
+        id: detect-tag
+        run: |
+          LATEST_TAG=$(git tag -l 'v*' | sort -V | tail -1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "::error::No upstream tags found"
+            exit 1
+          fi
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream tag: $LATEST_TAG"
+
+      - name: Check if sync is needed
+        id: check-sync
+        run: |
+          LATEST_TAG="${{ steps.detect-tag.outputs.tag }}"
+
+          if ! git rev-parse --verify origin/anthropic/main >/dev/null 2>&1; then
+            echo "::error::Branch anthropic/main not found"
+            exit 1
+          fi
+
+          git checkout anthropic/main
+
+          if git merge-base --is-ancestor "$LATEST_TAG" HEAD; then
+            echo "anthropic/main already includes $LATEST_TAG — no sync needed"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Sync needed: anthropic/main does not include $LATEST_TAG"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Close stale sync PRs
+        if: steps.check-sync.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG="${{ steps.detect-tag.outputs.tag }}"
+
+          gh pr list --base anthropic/main --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | [.number, .headRefName] | @tsv' | \
+          while IFS=$'\t' read -r pr_num branch; do
+            echo "Closing stale sync PR #$pr_num ($branch)"
+            gh pr close "$pr_num" --comment "Superseded by sync to $LATEST_TAG"
+            git push origin --delete "$branch" 2>/dev/null || true
+          done
+
+      - name: Attempt rebase onto latest tag
+        id: rebase
+        if: steps.check-sync.outputs.needed == 'true'
+        run: |
+          LATEST_TAG="${{ steps.detect-tag.outputs.tag }}"
+          git checkout anthropic/main
+
+          if git rebase "$LATEST_TAG"; then
+            echo "Rebase onto $LATEST_TAG succeeded"
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "Rebase onto $LATEST_TAG failed — conflicts detected"
+            git rebase --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push sync branch and open PR
+        if: steps.check-sync.outputs.needed == 'true' && steps.rebase.outputs.status == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG="${{ steps.detect-tag.outputs.tag }}"
+          SYNC_BRANCH="sync/upstream-${LATEST_TAG}"
+
+          git checkout -b "$SYNC_BRANCH"
+          git push -f origin "$SYNC_BRANCH"
+
+          PR_BODY="Automated rebase of \`anthropic/main\` onto upstream tag \`${LATEST_TAG}\`.
+
+          **Action required:** Approve this PR to trigger a force-push of the rebased branch to \`anthropic/main\`.
+
+          > **Note:** This PR cannot be merged normally (rebase rewrites history). Approving it triggers the \`apply-sync\` workflow which force-pushes the result."
+
+          gh pr create \
+            --base anthropic/main \
+            --head "$SYNC_BRANCH" \
+            --title "Sync upstream: rebase anthropic/main onto ${LATEST_TAG}" \
+            --body "$PR_BODY"
+
+      - name: Open issue for rebase conflicts
+        if: steps.check-sync.outputs.needed == 'true' && steps.rebase.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG="${{ steps.detect-tag.outputs.tag }}"
+
+          # Re-attempt rebase to capture conflict details
+          git checkout anthropic/main
+          CONFLICT_OUTPUT=$(git rebase "$LATEST_TAG" 2>&1 || true)
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || echo "Unable to determine conflicting files")
+          git rebase --abort
+
+          ISSUE_BODY="Automated rebase of \`anthropic/main\` onto \`${LATEST_TAG}\` failed due to conflicts.
+
+          **Conflicting files:**
+          \`\`\`
+          ${CONFLICT_FILES}
+          \`\`\`
+
+          **Rebase output:**
+          \`\`\`
+          ${CONFLICT_OUTPUT}
+          \`\`\`
+
+          **Manual resolution steps:**
+          1. \`git fetch origin anthropic/main\`
+          2. \`git checkout anthropic/main\`
+          3. \`git rebase ${LATEST_TAG}\`
+          4. Resolve conflicts
+          5. \`git push --force origin anthropic/main\`"
+
+          gh issue create \
+            --title "Upstream sync conflict: rebase onto ${LATEST_TAG} failed" \
+            --body "$ISSUE_BODY"
